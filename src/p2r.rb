@@ -11,9 +11,16 @@ require 'win32ole'
 require 'net/http'
 require 'json'
 require 'date'
+require 'certified'
 require './p2r_lib.rb'
 
+require 'openssl'
+OpenSSL::SSL::VERIFY_PEER = OpenSSL::SSL::VERIFY_NONE
+
+#ENV['HTTP_DEBUG']
+
 puts '', HDR, ('=' * HDR.scan(/./mu).size), ''
+
 
 #---------------------------------------------------------------------
 # process command line arguments
@@ -60,6 +67,9 @@ rmp_id = $settings.delete 'redmine_project_id'
 missed_pars = %w(redmine_host redmine_api_key redmine_project_uuid resource_default_redmine_role_id) - $settings.keys
 
 chk !missed_pars.empty?, "ERROR: following settings not found in 'Redmine Sysncronization' task: #{missed_pars.sort.join ', '}"
+
+$settings['redmine_root'] = '' if !$settings['redmine_root']
+$settings['protocol'] = ($settings['redmine_port'] == 80)? 'http': 'https'
 
 #---------------------------------------------------------------------
 # check Redmine project availability
@@ -112,12 +122,12 @@ end
 # check default tracker and role
 #---------------------------------------------------------------------
 
-if ($dflt_tracker_id = $settings['task_default_redmine_tracker_id'])
+if (($dflt_tracker_id = $settings['task_default_redmine_tracker_id']))
   chk !$dflt_tracker_id.is_a?(Integer), "ERROR: parameter task_default_redmine_tracker_id must be integer"
   trackers = rm_get '/trackers.json', 'trackers', 'ERROR: could not get Redmine tracker list'
   found = false
   trackers.each do |t|
-    if t['id'] = $dflt_tracker_id
+    if (t['id'] = $dflt_tracker_id)
       found=true
       break
     end
@@ -128,6 +138,25 @@ end
 $dflt_role_id = $settings['resource_default_redmine_role_id']
 chk !$dflt_tracker_id.is_a?(Integer), "ERROR: parameter task_default_redmine_tracker_id must be integer"
 rm_get "/roles/#{$dflt_role_id}.json", 'role', "ERROR: could not get default team role resource_default_redmine_role_id=#{$dflt_role_id}"
+
+#---------------------------------------------------------------------
+# util for loading redmine users
+#---------------------------------------------------------------------
+$users = {}
+def load_users
+  offset = 0
+  loop do
+    re = rm_request "/users.json?offset=#{offset}"
+    chk (re.code != '200'), 'ERROR: could not get Redmine users'
+    re = JSON.parse(re.body) rescue nil
+    chk re.nil?, 'ERROR: could not parse reply of users list request'
+    break if re['users'].empty? or re['limit'].nil?
+    re['users'].each do |m|
+      $users[m['id']] = m
+    end
+    offset += re['limit']
+  end
+end
 
 #---------------------------------------------------------------------
 # util for loading project team
@@ -151,11 +180,19 @@ end
 #---------------------------------------------------------------------
 # some utils for msp custom fields editing
 #---------------------------------------------------------------------
-
 def set_mst_url(mst, rmt_id)
-  url="http://#{$settings['redmine_host']}:#{$settings['redmine_port']}/issues/#{rmt_id}"
+  url="#{$settings['protocol']}://#{$settings['redmine_host']}:#{$settings['redmine_port']}#{$settings['redmine_root']}/issues/#{rmt_id}"
   mst.HyperlinkAddress = url
   return url
+end
+
+#---------------------------------------------------------------------
+# some utils for msp custom fields editing
+#---------------------------------------------------------------------
+def set_msr_url(msr, rmu_id)
+  msr.Hyperlink = rmu_id
+  url="#{$settings['protocol']}://#{$settings['redmine_host']}:#{$settings['redmine_port']}#{$settings['redmine_root']}/people/#{rmu_id}"
+  msr.HyperlinkAddress = url
 end
 
 #---------------------------------------------------------------------
@@ -189,7 +226,7 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
       end
     else
       rmt_papa_id = 0
-      mst_papa.Hyperlink = '0'
+      #mst_papa.Hyperlink = '0'
       rmt_papa = process_issue rmp_id, mst_papa, false, true
     end
 
@@ -199,39 +236,77 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
   #   we expect not more than one synchronizable appointment
   rmu_id_ok = nil
   msr_ok = nil
+  watcher_ids = []
+  
   (1..mst.Resources.Count).each do |j|
-    next unless msr = mst.Resources(j)
+    next unless (msr = mst.Resources(j))
     rmu_id = msr.Hyperlink
     next unless rmu_id =~ /^\s*\d+\s*$/ # resource not marked for sync
-    chk rmu_id_ok, "ERROR: more than one sync resource for MSP task #{mst.ID} '#{mst_name}'"
-    rmu_id = rmu_id.to_i
+    #chk rmu_id_ok, "ERROR: more than one sync resource for MSP task #{mst.ID} '#{mst_name}'"
+    
+    if rmu_id == '0'
+      rmu_name = msr.Initials
+      rm_user = $users.find {|key, value| value['login'] == rmu_name}
+      if !rm_user
+        user = {}
+        user["login"] = rmu_name
+        user["generate_password"] = true
+        user["firstname"] = msr.Name
+        user["lastname"] = "Autocreated by P2R"
+        user["admin"] = false
+        user["mail"] = rmu_name + '@email.com'
+        
+        if DRY_RUN
+          rmu_id = 1000+j
+          puts "User " + user.to_s + " will be created"
+          user["id"] = rmu_id
+          $users[rmu_id] = user
+        else
+          rmu_id = create_redmine_user(user)
+          puts "User " + user.to_s + " created"
+        end
+      else
+        rmu_id = rm_user[0]
+      end
+      if (!DRY_RUN)
+        set_msr_url msr, rmu_id
+      end
+    end
 
-    if $rmus.include? rmu_id
-      # resource already processed
-      rmu_id_ok = rmu_id
-      msr_ok = msr
-    else
+    rmu_id = rmu_id.to_i
+    watcher_ids.push rmu_id if (j > 1)
+    
+    if !$rmus.include? rmu_id
       member = $team[rmu_id]
       unless member
         # Redmine user is not team member - create new membership
         # check user availability
-        re = rm_request "/users/#{rmu_id}.json"
-        chk (re.code != '200'), "ERROR: Redmine user #{rmu_id} not found for resource in MSP task #{mst.ID} '#{mst_name}'"
-        re = JSON.parse(re.body) rescue nil
-        chk re.nil?, "ERROR: could not parse reply: Redmine user #{rmu_id} not found for resource in MSP task #{mst.ID} '#{mst_name}'"
+        #re = rm_request "/users/#{rmu_id}.json"
+        #chk (re.code != '200'), "ERROR: Redmine user #{rmu_id} not found for resource in MSP task #{mst.ID} '#{mst_name}'"
+        #re = JSON.parse(re.body) rescue nil
+        #chk re.nil?, "ERROR: could not parse reply: Redmine user #{rmu_id} not found for resource in MSP task #{mst.ID} '#{mst_name}'"
         # create membership
-        data = {user_id: rmu_id, role_ids: [$dflt_role_id]}
-        member = rm_create "/projects/#{$uuid}/memberships.json", 'membership', data,
-                         "ERROR: could not create Redmine project membership for user #{rmu_id}"
-        puts "New membership created for user: #{rmu_id}"
+        if DRY_RUN
+          puts "User " + rmu_name + " is not a member of project. Membership will be created"
+          member = {'id': $team.size+1, 'user': {'id': rmu_id, 'name': rmu_name}}
+        else
+          data = {user_id: rmu_id, role_ids: [$dflt_role_id]}
+          member = rm_create "/projects/#{$uuid}/memberships.json", 'membership', data,
+                          "ERROR: could not create Redmine project membership for user #{rmu_id}"
+          puts "New membership created for user: #{rmu_id}"
+        end
         $team[rmu_id] = member
       end
+    end
+
+    if 1 == j
       rmu_id_ok = rmu_id
-      msr_ok = msr
+      msr_ok = msr      
     end
   end
+
   if rmu_id_ok
-    rmu_name = $team[rmu_id_ok]['user']['name']
+    rmu_name = $users[rmu_id_ok]['firstname']
     msr_name = msr_ok.Name.clone.encode 'UTF-8'
     unless rmu_name == msr_name
       puts "WARNING: RM user ID=#{rmu_id_ok} name '#{rmu_name}' does not correspond to MSP resource name '#{msr_name}' (task ##{rmt_id} for #{mst.ID} '#{mst_name}')"
@@ -239,7 +314,6 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
   end
 
   if rmt_id == 0 || force_new_task
-
     # create new task
     unless DRY_RUN
       rmt = {
@@ -248,6 +322,7 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
           assigned_to_id: rmu_id_ok, tracker_id: $dflt_tracker_id,
           parent_issue_id: (rmt_papa ? rmt_papa['id'] : '')
       }
+      rmt['watcher_user_ids'] = watcher_ids if !watcher_ids.empty?
       rmt['estimated_hours'] = mst.Work/60 unless is_group
       rmt = rm_create '/issues.json', 'issue', rmt,
                       "ERROR: could not create Redmine task from #{mst.ID} '#{mst_name}' for some reasons"
@@ -258,20 +333,18 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
 
       $rmts[rmt['id']] = rmt
       return rmt
-
     else
+      if !$rmts[mst.ID]
+        $rmts[mst.ID] = 1 
       # keep task to be created
-      puts "Will create task #{mst.ID} '#{mst_name}'"
-
+        puts "Will create task #{mst.ID} '#{mst_name}'"
+      end
       return nil
-
     end
-
   else
-
     # update existing task
     #   check task availability
-    rmt = rm_get "/issues/#{rmt_id}.json", 'issue', "ERROR: could not find Redmine task ##{rmt_id} for #{mst.ID} '#{mst_name}'"
+    rmt = rm_get "/issues/#{rmt_id}.json?include=watchers", 'issue', "ERROR: could not find Redmine task ##{rmt_id} for #{mst.ID} '#{mst_name}'"
 
     #   check for changes
     #     to RM: subject - Name, parent_id - OutlineParent.Hyperlink, assigned_to_id - rmu_id_ok
@@ -284,7 +357,11 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
     rmt_papa_id_old = (rmt['parent'] ? rmt['parent']['id'] : '')
     rmt_papa_id_new = (rmt_papa ? rmt_papa['id'] : '')
     changes['parent_issue_id'] = rmt_papa_id_new if rmt_papa_id_new != rmt_papa_id_old
-
+    if !watcher_ids.empty?
+      m = rmt['watchers'].map{|item| item['id']}
+      changes['watcher_user_ids'] = watcher_ids if (m != watcher_ids)
+    end
+    
     # collect changes to MSP
     unless is_group
       changes2={}
@@ -364,31 +441,37 @@ end
 #---------------------------------------------------------------------
 # iterate over task list
 #---------------------------------------------------------------------
-
 def process_issues rmp_id, force_new_task = false
 
   (1..$msp.Tasks.Count).each do |i|
 
     # check msp task
-    next unless mst = $msp.Tasks(i)
+    next unless (mst = $msp.Tasks(i))
 
     is_group = (mst.OutlineChildren.Count > 0)
     process_issue rmp_id, mst, force_new_task, is_group
 
   end
 end
-
+#---------------------------------------------------------------------
+# create new user 
+# @returns user_id
+#---------------------------------------------------------------------
+def create_redmine_user (user)
+  new_user = rm_create '/users.json', 'user', user,
+  "ERROR: could not create Redmine user from #{user['login']} '#{user['name']}' for some reasons"
+  $users[new_user['id']] = new_user
+  return new_user['id']
+end
 #=====================================================================
 # main work cycle
 #=====================================================================
-
 settings_task.Start = Time.now unless DRY_RUN
 
 if rmp_id
   #=====================================================================
   # existing Redmine project update
   #---------------------------------------------------------------------
-
   puts 'Existing Redmine project update'
 
 else
@@ -418,11 +501,10 @@ else
 
 end
 
+load_users
 load_team
 process_issues (rmp_id || rmp['id']), rmp_id.nil?
 
 settings_task.Finish = Time.now unless DRY_RUN
 
 puts "\n\n"
-
-
