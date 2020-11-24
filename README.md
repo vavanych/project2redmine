@@ -20,6 +20,8 @@ P2R is designed by the following use-case:
 * project manager runs P2R periodically to get actual data back to MSP
 * P2R sets start, finish, estimate and spent hours in MSP according to Redmine data
 * project manager compares data with baselines and corrects remaining part of the projects as necessary
+* redmine users are created if they don't exist
+* https is used if redmine_port = 443
 
 ## MSP project preparation
 
@@ -44,15 +46,19 @@ If an 'Unprocessable Entry' error occurs on project creation it is probably due 
 
 Parameter `task_default_redmine_tracker_id` is not required. If you omit it then Redmine's default tracker will be set.
 
+Add parameter `redmine_root` (f.e. redmine_root: /redmine) if you have custom web-root folder
+
 If you want to connect your MSP project to existing Redmine project instead of creating new one, please do the following:
 
 1. Add parameter redmine_project_id to settings list and set it to Redmine project ID (not uuid!). 
 (It was not obvious how to get it from Redmine. Easy way is to get project in JSON format, for example, from URL `http://192.168.10.23:3500/projects/uute.json` for project described above.)
 2. Put real Redmine task IDs instead of 0 for tasks to be synchronized.
 
+
+
 ## Some limitations
 
-Redmine issue (task) can be appointed to one team member only so P2R expects no more than one synchronizable resourse per MSP project task. If more, an error will be reported and script stopped.
+Redmine issue (task) can be appointed to one team member only so P2R sets the first resource as task owner and the rest as watchers
 
 ## Synchronization
 
@@ -60,7 +66,6 @@ Redmine issue (task) can be appointed to one team member only so P2R expects no 
 2. Run script without command line parameters. It will perform dry run and report all changes to be made. (Not necessary.)
 3. Run script with -e parameter. It will perform real execution and make necessary changes to Redmine as well as MSP. 
 
-Working directory does not matter. You can run script itself (if you have ruby installed) or compiled .EXE file from downloads folder 
-(it does not require ruby installation). Compiled exe is just SFX archive with the same script plus necessary ruby binaries and libs.
+Working directory does not matter
 
 P2R sets 'Redmine Synchronization' task's dates to last synchronization dates on each run with execution. 
