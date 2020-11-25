@@ -201,18 +201,39 @@ end
 
 $rmts={} # issues processed
 $rmus=[] # memberships processed
+$skipped=[] #not synchronized task list
+$msp_updated=[] #msp tasks updated
+$rmt_updated=[] #redmine tasks updated
 
 def process_issue rmp_id, mst, force_new_task = false, is_group = false
 
   mst_name = mst.Name.clone.encode 'UTF-8'
   rmt_id = mst.Hyperlink
-  return nil unless rmt_id =~ /^\s*\d+\s*$/ # task not marked for sync
-  rmt_id = rmt_id.to_i
+
+  if ! (rmt_id =~ /^\s*\d+\s*$/) # task not marked for sync
+    if $skipped.index(mst.ID).nil?
+      puts "MSP #{mst.ID} '#{mst_name}': Skipping !!!"
+      $skipped.push(mst.ID)
+    end
+    return nil
+  else
+    rmt_id = rmt_id.to_i
+  end
 
   if (rmt = $rmts[rmt_id])
     return rmt # already processed
   end
 
+  rmt = nil
+  if rmt_id != 0 
+    re = rm_request "/issues/#{rmt_id}.json?include=watchers"
+    rmt = JSON.parse(re.body)['issue'] rescue nil if re.is_a? Net::HTTPOK
+    if !rmt
+      puts "MSP #{mst.ID} '#{mst_name}': Redmine issue# #{rmt_id} not found!!!"
+      rmt_id = 0
+    end
+  end
+  
   # process task parent:
   mst_papa = mst.OutlineParent
   rmt_papa = nil
@@ -242,7 +263,6 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
     next unless (msr = mst.Resources(j))
     rmu_id = msr.Hyperlink
     next unless rmu_id =~ /^\s*\d+\s*$/ # resource not marked for sync
-    #chk rmu_id_ok, "ERROR: more than one sync resource for MSP task #{mst.ID} '#{mst_name}'"
     
     if rmu_id == '0'
       rmu_name = msr.Initials
@@ -251,8 +271,8 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
         user = {}
         user["login"] = rmu_name
         user["generate_password"] = true
-        user["firstname"] = msr.Name
-        user["lastname"] = "Autocreated by P2R"
+        user["firstname"] = rmu_name
+        user["lastname"] = msr.Name
         user["admin"] = false
         user["mail"] = rmu_name + '@email.com'
         
@@ -323,14 +343,14 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
           parent_issue_id: (rmt_papa ? rmt_papa['id'] : '')
       }
       rmt['watcher_user_ids'] = watcher_ids if !watcher_ids.empty?
-      rmt['estimated_hours'] = mst.Work/60 unless is_group
+      rmt['estimated_hours'] = (mst.Work/60.0).round(2) unless is_group
       rmt = rm_create '/issues.json', 'issue', rmt,
                       "ERROR: could not create Redmine task from #{mst.ID} '#{mst_name}' for some reasons"
       # write new task number to MSP
       mst.Hyperlink = rmt['id']
       set_mst_url mst, rmt['id']
       puts "Created task Redmine ##{rmt['id']} from MSP #{mst.ID} '#{mst_name}'"
-
+      $rmt_updated.push rmt['id']
       $rmts[rmt['id']] = rmt
       return rmt
     else
@@ -343,9 +363,6 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
     end
   else
     # update existing task
-    #   check task availability
-    rmt = rm_get "/issues/#{rmt_id}.json?include=watchers", 'issue', "ERROR: could not find Redmine task ##{rmt_id} for #{mst.ID} '#{mst_name}'"
-
     #   check for changes
     #     to RM: subject - Name, parent_id - OutlineParent.Hyperlink, assigned_to_id - rmu_id_ok
     #     to MSP: start_date - Start, due_date - Finish, estimated_hours - Work, sum of reports - ActualWork
@@ -361,7 +378,11 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
       m = rmt['watchers'].map{|item| item['id']}
       changes['watcher_user_ids'] = watcher_ids if (m != watcher_ids)
     end
-    
+#    if rmt['estimated_hours'] && (rmt['estimated_hours'].round(2) != rmt['estimated_hours'])
+#      rmt['estimated_hours'] = rmt['estimated_hours'].round(2)
+#      changes['estimated_hours'] = rmt['estimated_hours']
+#    end
+  
     # collect changes to MSP
     unless is_group
       changes2={}
@@ -370,24 +391,26 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
       d = mst.Finish.strftime('%Y-%m-%d')
       changes2['due_date'] = rmt['due_date'] if rmt['due_date'] != d
       # calculate estimate and spent hours
-      spent = (rmt['spent_hours'] || 0.0) * 60
+      spent = (rmt['spent_hours'] || 0.0) * 60.0
       changes2['spent_hours'] = spent if spent != mst.ActualWork
-      est = (rmt['estimated_hours'] || 0.0) * 60
+      est = (rmt['estimated_hours'] || 0.0) * 60.0
       if rmt['done_ratio'] > 0 && spent > 0
         # we will consider priority of done ratio over estimated hours
-        est = spent * 100 / rmt['done_ratio']
+        est = (spent * 100.0 / rmt['done_ratio']).round(2)
       elsif rmt['done_ratio'] == 0 && spent > 0
         # done ratio is wrong
         if est >= spent
           # some discrepancy - we will fix done ratio in RM
-          changes['done_ratio'] = spent * 100 / est
+          changes['done_ratio'] = spent * 100.0 / est
         else
           # some error in estimate? we will ignore estimate and warn
           est = nil
           puts "Warning: estimated hours less than spent hours, estimate will be ignored"
         end
       end
-      changes2['estimated_hours'] = est if est && est != mst.Work
+      if est && est.round(0) != mst.Work
+        changes2['estimated_hours'] = est 
+      end
     end
 
     # apply changes to RM
@@ -404,6 +427,7 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
                   "ERROR: could not update Redmine task ##{rmt['id']} from #{mst.ID} '#{mst_name}' for some reasons"
         rmt = rm_get "/issues/#{rmt_id}.json", 'issue', "ERROR: could not find Redmine task ##{rmt_id} for #{mst.ID} '#{mst_name}'"
         puts "Updated task Redmine ##{rmt_id} from MSP #{mst.ID} '#{mst_name}' (#{changelist})"
+        $rmt_updated.push rmt_id
       end
     end
 
@@ -426,6 +450,7 @@ def process_issue rmp_id, mst, force_new_task = false, is_group = false
             end
           end
           puts "Updated MSP task #{mst.ID} '#{mst_name}' from Redmine ##{rmt_id} (#{changelist2})"
+          $msp_updated.push mst.ID
         end
       end
     end
@@ -507,4 +532,7 @@ process_issues (rmp_id || rmp['id']), rmp_id.nil?
 
 settings_task.Finish = Time.now unless DRY_RUN
 
-puts "\n\n"
+puts "----------------------------------------------------"
+puts "MSP tasks skipped:      #{$skipped.size} -> #{$skipped}"
+puts "Redmine issues updated: #{$rmt_updated.size} -> #{$rmt_updated}"
+puts "MSP tasks updated:      #{$msp_updated.size} -> #{$msp_updated}"
